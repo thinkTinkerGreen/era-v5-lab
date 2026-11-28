@@ -53,6 +53,9 @@ def feed_row(rec: dict) -> dict:
     envs = {name: round(v["passes"] / v["rollouts"], 6) for name, v in (rec.get("subgroups") or {}).items() if v.get("rollouts")}
     if envs:
         row["reward_per_env"] = envs
+    for k, v in rec.items():
+        if k.startswith("minibench/") and v is not None:
+            row[k] = v
     return row
 
 
@@ -64,12 +67,17 @@ def convert(metrics: Path, out: Path, summary: Path | None = None, evals: Path |
     rows = [feed_row(rec) for rec in _jsonl(metrics)]
     evals = evals or metrics.parent / "evals.jsonl"
     if evals.exists():
+        eval_rows = _jsonl(evals)
         names = {"heldout": "heldout_reward", "heldout_quant": "heldout_reward_quant"}
-        by_step = {(e["step"], names[e["name"]]): e["pass"] for e in _jsonl(evals) if e.get("name") in names}
+        by_step = {(e["step"], names[e["name"]]): e["pass"] for e in eval_rows if e.get("name") in names}
+        mb_by_step = {e["step"]: (e.get("metrics") or {}) for e in eval_rows if e.get("name") == "minibench"}
         for row in rows:
             for key in names.values():
                 if key not in row and (row["step"], key) in by_step:
                     row[key] = by_step[row["step"], key]
+            for k, v in mb_by_step.get(row["step"], {}).items():
+                if k not in row and v is not None:
+                    row[k] = v
     if summary is not None and rows:
         ok = json.loads(summary.read_text(encoding="utf-8")).get("router_unchanged")
         if ok is not None:

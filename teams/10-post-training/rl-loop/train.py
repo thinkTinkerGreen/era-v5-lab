@@ -89,6 +89,7 @@ sys.path.insert(0, str(HERE))
 
 import grpo  # noqa: E402
 import heldout  # noqa: E402
+import minibench_hook  # noqa: E402
 import quant_rollout  # noqa: E402
 import rollout  # noqa: E402
 import router  # noqa: E402
@@ -1115,6 +1116,7 @@ def train(cfg: dict) -> dict:
     start = time.time()
     heldout_curve, heldout_scores, routing_curve = [], {}, []
     cohort_scores: dict = {}
+    minibench_steps = minibench_hook.hydrate_minibench_steps(past_evals)
     for r_ in past_evals:  # results measured before the restart count as measured
         if r_["name"] == "heldout":
             heldout_curve.append((r_["step"], r_["pass"]))
@@ -1156,6 +1158,21 @@ def train(cfg: dict) -> dict:
                              **length_stats(rolls, extra_max_new, policy.eos_id)}
         print(json.dumps({"extra_eval_step": step, "max_new": extra_max_new,
                           **{k_: v for k_, v in extra_evals[step].items() if k_ != "scores"}}), flush=True)
+
+    minibench_every = int(t.get("minibench_every", 0))
+    minibench_profile = str(t.get("minibench_profile", "quick"))
+    minibench_on_missing = str(t.get("minibench_on_missing", "skip"))
+
+    def log_minibench(step: int) -> dict:
+        if not minibench_every or step in minibench_steps:
+            return {}
+        res = minibench_hook.run_minibench(
+            policy, step=step, profile=minibench_profile, on_missing=minibench_on_missing
+        )
+        minibench_steps.add(step)
+        append_jsonl(evals_path, {"name": "minibench", "step": step, "profile": minibench_profile,
+                                  "status": res["status"], "metrics": res["metrics"]})
+        return res["metrics"]
 
     def log_heldout(step):
         c0_ = time.time()
@@ -1279,8 +1296,9 @@ def train(cfg: dict) -> dict:
         h0 = heldout_curve[0][1]
     else:
         h0, extra0 = log_heldout(0)
+        mb0 = log_minibench(0)
         if cfg.get("verbose", True):
-            print(json.dumps({"step": 0, "heldout_reward": h0, **extra0}), flush=True)
+            print(json.dumps({"step": 0, "heldout_reward": h0, **extra0, **mb0}), flush=True)
     if cohort_k and 0 not in cohort_scores:
         cohort_eval(0)
     if extra_max_new:
@@ -1290,6 +1308,9 @@ def train(cfg: dict) -> dict:
             log_heldout(start_step)
         if cohort_k and start_step not in cohort_scores:
             cohort_eval(start_step)
+    if state_dir is not None and minibench_every > 0 and start_step > 0 and start_step % minibench_every == 0:
+        if start_step not in minibench_steps:
+            log_minibench(start_step)
     steps_done, paused, last_step_s = start_step, False, 0.0
     opt_sync = (lambda: torch.cuda.synchronize(device)) if time_sync else None  # so optim_step_s times the step itself
     for step in range(start_step + 1, int(t["steps"]) + 1):
@@ -1527,10 +1548,13 @@ def train(cfg: dict) -> dict:
         if grad_norm is not None and "grad_norm" not in rec:
             rec["grad_norm"] = float(f"{grad_norm:.4g}")
         due = step % int(t.get("eval_every", 10)) == 0 or step == int(t["steps"])
+        mb_due = minibench_every > 0 and (step % minibench_every == 0 or step == int(t["steps"]))
         if state_dir is None:  # original order: the evaluation is part of the step's row
             if due:
                 rec["heldout_reward"], extra = log_heldout(step)
                 rec.update({k_: v for k_, v in extra.items() if not k_.endswith("per_layer")})
+            if mb_due:
+                rec.update(log_minibench(step))
             metrics_f.write(json.dumps(rec) + "\n")
             metrics_f.flush()
         else:  # durable order: the step's row and the state reach disk before any evaluation starts
@@ -1543,6 +1567,8 @@ def train(cfg: dict) -> dict:
                 rec["heldout_reward"], _ = log_heldout(step)
                 if cohort_k:
                     cohort_eval(step)
+            if mb_due:
+                log_minibench(step)
         if cfg.get("verbose", True):
             print(json.dumps(rec), flush=True)
         if quant_stop:
@@ -1568,6 +1594,8 @@ def train(cfg: dict) -> dict:
             log_heldout(steps_done)
         if cohort_k and steps_done not in cohort_scores:
             cohort_eval(steps_done)
+        if minibench_every > 0 and steps_done not in minibench_steps:
+            log_minibench(steps_done)
     if extra_max_new:
         extra_eval(int(t["steps"]))
     saved_weights = None
